@@ -906,9 +906,9 @@ async function loadDB() {
       `${SB_URL}/rest/v1/data?id=eq.main&select=content`,
       { headers: { 'apikey': SB_KEY, 'Authorization': 'Bearer ' + SB_KEY } }
     );
-    if (!r.ok) { console.error('loadDB HTTP error:', r.status); return; }
+    if (!r.ok) { console.error('loadDB HTTP error:', r.status); _loadFromLocalBackup(); return; }
     const rows = await r.json();
-    if (!rows || !rows.length || !rows[0].content) return;
+    if (!rows || !rows.length || !rows[0].content) { _loadFromLocalBackup(); return; }
     const d = rows[0].content;
     let rawSubjects = [], rawExamEvents = [];
     if (Array.isArray(d)) {
@@ -919,42 +919,87 @@ async function loadDB() {
     }
     subjects   = rawSubjects.map(_normalizeSubject);
     examEvents = rawExamEvents.filter(ev => ev && ev.folderId && ev.date);
+    // Always keep a local backup after successful load from Supabase
+    _saveLocalBackup();
   } catch (e) {
     console.error('loadDB error:', e);
+    _loadFromLocalBackup();
   }
 }
 
+function _saveLocalBackup() {
+  try { localStorage.setItem('sha-backup', JSON.stringify({ subjects, examEvents })); } catch(e) {}
+}
+function _loadFromLocalBackup() {
+  try {
+    const bk = localStorage.getItem('sha-backup');
+    if (!bk) return;
+    const d = JSON.parse(bk);
+    if (d && Array.isArray(d.subjects)) {
+      subjects   = d.subjects.map(_normalizeSubject);
+      examEvents = Array.isArray(d.examEvents) ? d.examEvents.filter(ev => ev && ev.folderId && ev.date) : [];
+      console.log('Loaded from local backup~');
+    }
+  } catch(e) { console.error('backup load error:', e); }
+}
+
 async function _doSave() {
+  const ind = document.getElementById('save-indicator');
   try {
     const payload = JSON.parse(JSON.stringify({ subjects, examEvents }));
-    await fetch(`${SB_URL}/rest/v1/data?id=eq.main`, {
-      method: 'PATCH',
+    // Use UPSERT (POST + Prefer: resolution=merge-duplicates) so row is created if not exist
+    const r = await fetch(`${SB_URL}/rest/v1/data`, {
+      method: 'POST',
       headers: {
         'apikey': SB_KEY,
         'Authorization': 'Bearer ' + SB_KEY,
         'Content-Type': 'application/json',
-        'Prefer': 'return=minimal'
+        'Prefer': 'resolution=merge-duplicates,return=minimal'
       },
-      body: JSON.stringify({ content: payload, updated_at: new Date().toISOString() })
+      body: JSON.stringify({ id: 'main', content: payload, updated_at: new Date().toISOString() })
     });
+    if (!r.ok) {
+      const errText = await r.text().catch(() => r.status);
+      console.error('save HTTP error:', r.status, errText);
+      if (ind) { ind.textContent = 'save failed! 😰'; ind.style.background = '#fde8e8'; ind.style.color = '#e05555'; ind.style.borderColor = '#f9b0b0'; ind.classList.add('show'); clearTimeout(ind._t); ind._t = setTimeout(() => { ind.classList.remove('show'); ind.textContent = 'saving~ 🎀'; ind.style.background = ''; ind.style.color = ''; ind.style.borderColor = ''; }, 3000); }
+      return false;
+    }
+    // Save local backup on successful Supabase save
+    _saveLocalBackup();
+    return true;
   } catch (e) {
     console.error('save error:', e);
+    if (ind) { ind.textContent = 'no connection 😰'; ind.style.background = '#fde8e8'; ind.style.color = '#e05555'; ind.style.borderColor = '#f9b0b0'; ind.classList.add('show'); clearTimeout(ind._t); ind._t = setTimeout(() => { ind.classList.remove('show'); ind.textContent = 'saving~ 🎀'; ind.style.background = ''; ind.style.color = ''; ind.style.borderColor = ''; }, 3000); }
+    return false;
   }
 }
 
 function save() {
   const ind = document.getElementById('save-indicator');
   if (ind) {
+    ind.textContent = 'saving~ 🎀';
+    ind.style.background = ''; ind.style.color = ''; ind.style.borderColor = '';
     ind.classList.add('show');
     clearTimeout(ind._t);
-    ind._t = setTimeout(() => ind.classList.remove('show'), 1800);
+    ind._t = setTimeout(() => ind.classList.remove('show'), 2200);
   }
   clearTimeout(_saveT);
-  _saveT = setTimeout(_doSave, 800);
+  _saveT = setTimeout(_doSave, 400); // reduced from 800ms to 400ms
 }
 
-window.addEventListener('beforeunload', () => {
-  if (_saveT) { clearTimeout(_saveT); _doSave(); }
+// Use sendBeacon for reliable save on page close
+window.addEventListener('beforeunload', (e) => {
+  clearTimeout(_saveT);
+  try {
+    const payload = JSON.parse(JSON.stringify({ subjects, examEvents }));
+    const body = JSON.stringify({ id: 'main', content: payload, updated_at: new Date().toISOString() });
+    // sendBeacon is fire-and-forget but reliable on page unload
+    const blob = new Blob([body], { type: 'application/json' });
+    navigator.sendBeacon(
+      `${SB_URL}/rest/v1/data?apikey=${SB_KEY}`,
+      blob
+    );
+  } catch (err) { /* best effort */ }
 });
 
 /* ═══════════════════════════════════════════════
